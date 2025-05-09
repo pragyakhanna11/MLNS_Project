@@ -44,7 +44,7 @@ class Trainer:
         
         print(f"Prepared {len(X)} training samples with window size {window_size}")
     
-    def train(self, num_epochs, use_physics=True, progressive_physics=True):
+    def train(self, num_epochs, use_physics=True, progressive_physics=True, physics_model="persistence"):
         """
         Train the model
         
@@ -52,14 +52,21 @@ class Trainer:
             num_epochs: Number of training epochs
             use_physics: Whether to use physics constraints
             progressive_physics: Whether to progressively increase physics weight
+            physics_model: Which physics model to use ("ou" or "persistence")
         """
         # Training parameters
         sigma_obs = 1e-2
         sigma_phys_init = 100.0
-        sigma_phys_final = 1.0
+        sigma_phys_final = 0.5  # Lower value gives stronger physics impact
         
         # Initialize tracking variables
         losses = []
+        loss_history = {
+            'total': [],
+            'kl': [],
+            'recon': [],
+            'physics': []
+        }
         best_loss = float('inf')
         best_state = None
         start_time = time.time()
@@ -70,11 +77,12 @@ class Trainer:
         # Training loop
         for epoch in progress_bar:
             epoch_loss = 0
+            epoch_components = {k: 0.0 for k in loss_history.keys()}
             batches = 0
             
             # Progressive increase of physics importance
             if progressive_physics:
-                # Start with very little physics influence and gradually increase
+                # More gradual physics incorporation
                 progress = min(1.0, (epoch / num_epochs) ** 2)  # Squared for slower ramp-up
                 sigma_phys = sigma_phys_init * (1 - progress) + sigma_phys_final * progress
                 # Only start adding physics after 20% of training
@@ -101,7 +109,8 @@ class Trainer:
                 loss, loss_components = compute_loss(
                     self.model, x_batch, self.time_tensor,
                     sigma_obs=sigma_obs, sigma_phys=sigma_phys,
-                    use_physics=use_physics, physics_weight=physics_weight
+                    use_physics=use_physics, physics_weight=physics_weight,
+                    physics_model=physics_model
                 )
                 
                 # Check for NaN loss
@@ -120,20 +129,27 @@ class Trainer:
                 
                 # Track loss
                 epoch_loss += loss_components['total']
+                for k, v in loss_components.items():
+                    epoch_components[k] += v
                 batches += 1
             
             # Skip reporting if no valid batches
             if batches == 0:
                 continue
                 
-            # Average loss for epoch
+            # Average losses for epoch
             avg_loss = epoch_loss / batches
             losses.append(avg_loss)
+            
+            # Track loss components
+            for k in epoch_components:
+                epoch_components[k] /= batches
+                loss_history[k].append(epoch_components[k])
             
             # Update progress bar
             progress_bar.set_postfix({
                 'loss': f"{avg_loss:.4f}",
-                'physics_weight': f"{physics_weight:.2f}"
+                'phys_w': f"{physics_weight:.2f}"
             })
             
             # Save best model
@@ -153,8 +169,9 @@ class Trainer:
         
         # Plot loss history
         self.plot_loss_history(losses)
+        self.plot_loss_components(loss_history)
         
-        return losses
+        return losses, loss_history
     
     def plot_loss_history(self, losses):
         """Plot training loss history"""
@@ -167,13 +184,30 @@ class Trainer:
         plt.savefig(os.path.join(self.output_dir, f"{self.model_type}_loss.png"))
         plt.close()
     
-    def generate_samples(self, num_samples=10, time_points=None, noise_scale=0.1):
+    def plot_loss_components(self, loss_history):
+        """Plot individual loss components"""
+        plt.figure(figsize=(12, 8))
+        
+        for component, values in loss_history.items():
+            if len(values) > 0:
+                plt.plot(values, label=component)
+        
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title(f'Loss Components - {self.model_type.upper()} Model')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.savefig(os.path.join(self.output_dir, f"{self.model_type}_loss_components.png"))
+        plt.close()
+    
+    def generate_samples(self, num_samples=10, time_points=None, noise_scale=0.05):
         """
         Generate trajectory samples from the trained model
         
         Args:
             num_samples: Number of samples to generate
             time_points: Optional custom time points for generation
+            noise_scale: Scale of noise to add to trajectories
         """
         # Use default time points if not provided
         if time_points is None:
@@ -190,7 +224,7 @@ class Trainer:
                 
                 # Generate sample
                 sample = self.model.decode(z, time_points).squeeze()
-            
+                
                 # Add small noise to prevent perfectly straight lines
                 noise = torch.randn_like(sample) * noise_scale
                 sample = (sample + noise).cpu().numpy()
